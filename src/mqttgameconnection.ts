@@ -6,6 +6,7 @@ import { MessageFactory } from './messagefactory';
 const nanoid = customAlphabet(urlAlphabet, 10);
 const clientTimeout = 3000;
 const pingCycle = 2000;
+const clientCheckInterval = Math.floor(clientTimeout * 2 / pingCycle);
 
 export class MqttGameConnection {
     private _conn: RawConnection;
@@ -17,11 +18,9 @@ export class MqttGameConnection {
 
     private _intervalId: any;
     private _pingTopic: string;
-    private _requestTopic: string;
-    private _requestClientTopic: string;
-    private _responseTopic: string;
+    private _messageAllTopic: string;
+    private _messageTopic: string;
     private _clients: Map<string, ClientPing> = new Map<string, ClientPing>();
-    private _requests: Map<string, ResponseWaiter> = new Map<string, ResponseWaiter>();
 
     constructor(host: string, port: number, gameName: string, gameId: string) {
         this._conn = new RawConnection(host, port, this._id, {protocolVersion: 5});
@@ -29,9 +28,8 @@ export class MqttGameConnection {
         this._gameName = gameName;
         this._gameId = gameId;
         this._pingTopic = `mqtt/game/${this._gameName}/${this._gameId}/ping`;
-        this._requestTopic = `mqtt/game/${this._gameName}/${this._gameId}/request`;
-        this._requestClientTopic = `mqtt/game/${this._gameName}/${this._gameId}/request/${this._id}`;
-        this._responseTopic = `mqtt/game/${this._gameName}/${this._gameId}/response`;
+        this._messageAllTopic = `mqtt/game/${this._gameName}/${this._gameId}/message`;
+        this._messageTopic = `mqtt/game/${this._gameName}/${this._gameId}/message/${this._id}`;
     }
 
     get Id() {
@@ -41,10 +39,9 @@ export class MqttGameConnection {
     async connect() {
         const result = await this._conn.connectAsync();
         this._conn.events.on('onMessage', this.processMessage)
-        this._conn.subscribe(this._pingTopic, {qos: 0, nl: true});
-        this._conn.subscribe(this._responseTopic, {qos: 0, nl: true});
-        this._conn.subscribe(this._requestTopic, {qos: 0, nl: true});
-        this._conn.subscribe(this._requestClientTopic, {qos: 0, nl: true});
+        this._conn.subscribe(this._pingTopic, {qos: 1, nl: true});
+        this._conn.subscribe(this._messageAllTopic, {qos: 1, nl: true});
+        this._conn.subscribe(this._messageTopic, {qos: 1, nl: true});
         this.startPinging();
         return result;
     }
@@ -67,26 +64,21 @@ export class MqttGameConnection {
     }
 
     sendMessageToClient<T>(receiverId: string, type: string, message: T) {
-        return new Promise((resolve, reject) => {
-            const request = this._factory.createRequest(message, type, receiverId);
-            const waiter = this._factory.createWaiter([receiverId], resolve, false);
-            this._requests.set(request.id, waiter);
-            this._conn.publishJson(this._factory.getRequestTopic(receiverId), request);
-        });
+        const request = this._factory.createRequest(message, type, receiverId);
+        const topic = this._factory.getRequestTopic(receiverId);
+        return this.sendMessage(topic, request);
     }
 
     sendMessageToAll<T>(type: string, message: T) {
-        return new Promise((resolve, reject) => {
-            const request = this._factory.createAllRequest(message, type);
-            const receivers = Array.from(this._clients.keys());
-            if(receivers.length === 0) {
-                console.warn('No Receivers Found');
-                reject();
-                return;
-            }
-            const waiter = this._factory.createWaiter(Array.from(this._clients.keys()), resolve, true);
-            this._requests.set(request.id, waiter);
-            this._conn.publishJson(this._requestTopic, request);
+        const request = this._factory.createAllRequest(message, type);
+        return this.sendMessage(this._messageAllTopic, request);
+    }
+
+    private sendMessage<T>(topic: string, message: T) {
+        return new Promise<boolean>((resolve, reject) => {
+            this._conn.publishJson(topic, message, { qos: 1 }, () => {
+                resolve(true);
+            });
         });
     }
 
@@ -96,7 +88,7 @@ export class MqttGameConnection {
             this._intervalId = setInterval(() => {
                 this._conn.publishJson(this._pingTopic, this._factory.createPing(this._status));
                 index++;
-                if (index % 3) {
+                if (index % clientCheckInterval) {
                     this.updateClients();
                     index = 0;
                 }
@@ -104,10 +96,6 @@ export class MqttGameConnection {
         }
     }
 
-    private sendResponse(msgId: string) {
-        console.log(`sending response ${msgId}`);
-        this._conn.publishJson(this._responseTopic, this._factory.createResponse(msgId));
-    }
 
     private processMessage = (message: MqttMessage) => {
         if (message.topic === this._pingTopic) {
@@ -115,42 +103,13 @@ export class MqttGameConnection {
             this._clients.set(pingMsg.id, pingMsg);
         }
 
-        if (message.topic === this._requestTopic) {
+        if (message.topic === this._messageAllTopic) {
             const requestAllMessage = message.getJsonObject<RequestAllMessage>();
             console.log(`got a request ${requestAllMessage.senderId} : ${requestAllMessage.id}`);
-            this.sendResponse(requestAllMessage.id);
         }
 
-        if (message.topic === this._requestClientTopic) {
+        if (message.topic === this._messageTopic) {
             const requestMessage = message.getJsonObject<RequestMessage>();
-            this.sendResponse(requestMessage.id);
-        }
-
-        if (message.topic === this._responseTopic) {
-            const responseMessage = message.getJsonObject<ResponseMessage>();
-            console.log(`Got Response ${responseMessage.receiverId} : ${responseMessage.msgId}`);
-            this.checkResponse(responseMessage);
-        }
-    }
-
-    private checkResponse(responseMessage: ResponseMessage) {
-        if (responseMessage.receiverId === this._id) {
-            return;
-        }
-        
-        const waiter = this._requests.get(responseMessage.msgId);
-        if (waiter) {
-            if (waiter.allResponse) {
-                waiter.responses.push(responseMessage.receiverId);
-                if (waiter.receivers.length <= waiter.responses.length) {
-                    this._requests.delete(responseMessage.msgId);
-                    console.log(waiter.responses);
-                    waiter.finish();
-                }
-            } else {
-                this._requests.delete(responseMessage.msgId);
-                waiter.finish();
-            }
         }
     }
 
